@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Cesium World Terrain Sampler</title>
+
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.145/Build/Cesium/Cesium.js"></script>
+
+<link
+  href="https://cesium.com/downloads/cesiumjs/releases/1.145/Build/Cesium/Widgets/widgets.css"
+  rel="stylesheet"
+/>
+
+<style>
+body {
+  font-family: system-ui, sans-serif;
+  margin: 24px;
+  max-width: 900px;
+}
+
+label {
+  display: block;
+  margin: 12px 0 6px;
+  font-weight: 600;
+}
+
+input,
+button {
+  font: inherit;
+  padding: 8px;
+}
+
+input[type=text] {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+button {
+  cursor: pointer;
+  margin-top: 14px;
+}
+
+#status {
+  white-space: pre-wrap;
+  background: #f5f5f5;
+  padding: 12px;
+  margin-top: 16px;
+  border-radius: 6px;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Cesium World Terrain Sampler</h1>
+
+<p>
+  This tool samples Cesium World Terrain at building centroid points
+  and downloads <code>terrain_elevations.json</code>.
+</p>
+
+<label>Cesium ion access token</label>
+
+<input
+  id="token"
+  type="text"
+  placeholder="Paste your Cesium ion token here"
+/>
+
+<label>Building centroid JSON</label>
+
+<input
+  id="file"
+  type="file"
+  accept="application/json,.json"
+/>
+
+<br />
+
+<button id="run">
+  Sample terrain
+</button>
+
+<div id="status">
+  Waiting.
+</div>
+
+<script>
+const status = document.getElementById('status');
+
+const setStatus = s => {
+  status.textContent = s;
+};
+
+async function sample() {
+
+  const token =
+    document.getElementById('token').value.trim();
+
+  const file =
+    document.getElementById('file').files[0];
+
+  if (!token) {
+    throw new Error(
+      'Please enter your Cesium ion token locally.'
+    );
+  }
+
+  if (!file) {
+    throw new Error(
+      'Please select a building centroid JSON file.'
+    );
+  }
+
+  Cesium.Ion.defaultAccessToken = token;
+
+  const source =
+    JSON.parse(await file.text());
+
+  const points =
+    source.points || [];
+
+  if (!points.length) {
+    throw new Error(
+      'No points found in the selected JSON.'
+    );
+  }
+
+  setStatus(
+    'Creating Cesium World Terrain provider...'
+  );
+
+  const terrainProvider =
+    await Cesium.createWorldTerrainAsync();
+
+  const results = [];
+
+  const batchSize = 500;
+
+  const totalBatches =
+    Math.ceil(
+      points.length / batchSize
+    );
+
+  for (
+    let start = 0;
+    start < points.length;
+    start += batchSize
+  ) {
+
+    const batch =
+      points.slice(
+        start,
+        start + batchSize
+      );
+
+    const positions =
+      batch.map(
+        p =>
+          Cesium.Cartographic.fromDegrees(
+            p.lon,
+            p.lat,
+            0
+          )
+      );
+
+    const updated =
+      await Cesium.sampleTerrainMostDetailed(
+        terrainProvider,
+        positions,
+        false
+      );
+
+    for (
+      let i = 0;
+      i < batch.length;
+      i++
+    ) {
+
+      const h =
+        updated[i]
+        && Number.isFinite(
+          updated[i].height
+        )
+          ? updated[i].height
+          : null;
+
+      results.push({
+        id: batch[i].id,
+        lon: batch[i].lon,
+        lat: batch[i].lat,
+        terrainHeight: h
+      });
+    }
+
+    const done =
+      Math.min(
+        start + batch.length,
+        points.length
+      );
+
+    const pct =
+      (
+        done
+        / points.length
+        * 100
+      ).toFixed(1);
+
+    setStatus(
+      `Sampling Cesium World Terrain...\n` +
+      `${done.toLocaleString()} / ` +
+      `${points.length.toLocaleString()} ` +
+      `buildings (${pct}%)\n` +
+      `Batch ${Math.floor(start / batchSize) + 1} / ` +
+      `${totalBatches}`
+    );
+  }
+
+  const valid =
+    results.filter(
+      x =>
+        x.terrainHeight !== null
+    ).length;
+
+  const missing =
+    results.length - valid;
+
+  const output = {
+
+    source:
+      'Cesium World Terrain',
+
+    method:
+      'Cesium.sampleTerrainMostDetailed',
+
+    heightReference:
+      'WGS84 ellipsoid height',
+
+    count:
+      results.length,
+
+    valid,
+    missing,
+
+    elevations:
+      results
+  };
+
+  const blob =
+    new Blob(
+      [
+        JSON.stringify(
+          output,
+          null,
+          2
+        )
+      ],
+      {
+        type:
+          'application/json'
+      }
+    );
+
+  const url =
+    URL.createObjectURL(blob);
+
+  const a =
+    document.createElement('a');
+
+  a.href = url;
+
+  a.download =
+    'terrain_elevations.json';
+
+  a.click();
+
+  URL.revokeObjectURL(url);
+
+  setStatus(
+    `Done.\n` +
+    `${valid.toLocaleString()} valid terrain heights\n` +
+    `${missing.toLocaleString()} missing heights\n` +
+    `Downloaded: terrain_elevations.json`
+  );
+}
+
+document
+  .getElementById('run')
+  .addEventListener(
+    'click',
+    async () => {
+      try {
+        await sample();
+      }
+      catch (e) {
+        console.error(e);
+
+        setStatus(
+          'ERROR: ' +
+          (e?.message || e)
+        );
+      }
+    }
+  );
+</script>
+
+</body>
+</html>

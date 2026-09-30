@@ -1,0 +1,4 @@
+Project name: geojson-buildings-to-3dtiles
+Project title: Convert Building GeoJSON to 3D Tiles for Cesium
+GitHub owner: PeiChiTsai
+Description: Convert building footprint GeoJSON into spatially tiled 3D Tiles (B3DM) for Cesium and other 3D Tiles viewers.

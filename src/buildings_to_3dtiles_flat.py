@@ -1,0 +1,938 @@
+import argparse
+import json
+import math
+import shutil
+import struct
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+from pyproj import Transformer
+from shapely.ops import triangulate
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_DIR = PROJECT_DIR / "data"
+DEFAULT_OUTPUT_DIR = PROJECT_DIR / "output"
+
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+parser = argparse.ArgumentParser(
+    description=(
+        "Convert building footprint GeoJSON into flat 3D Tiles."
+    )
+)
+
+parser.add_argument(
+    "--input",
+    type=Path,
+    default=DEFAULT_DATA_DIR / "sample_buildings.geojson",
+    help="Input building footprint GeoJSON."
+)
+
+parser.add_argument(
+    "--out",
+    type=Path,
+    default=DEFAULT_OUTPUT_DIR / "my_city_flat",
+    help="Output directory for the generated 3D Tiles."
+)
+
+parser.add_argument(
+    "--nx",
+    type=int,
+    default=16,
+    help="Number of tiles along the X direction."
+)
+
+parser.add_argument(
+    "--ny",
+    type=int,
+    default=16,
+    help="Number of tiles along the Y direction."
+)
+
+parser.add_argument(
+    "--min-height",
+    type=float,
+    default=0.02,
+    help="Minimum building height in metres."
+)
+
+args = parser.parse_args()
+
+INPUT = args.input
+OUT = args.out
+
+NX = args.nx
+NY = args.ny
+MIN_HEIGHT = args.min_height
+
+
+# ============================================================
+# INPUT VALIDATION
+# ============================================================
+
+if not INPUT.exists():
+    raise SystemExit(f"Missing input GeoJSON: {INPUT}")
+
+if NX < 1 or NY < 1:
+    raise SystemExit("--nx and --ny must both be >= 1.")
+
+if MIN_HEIGHT < 0:
+    raise SystemExit("--min-height must be >= 0.")
+
+if OUT.exists():
+    print(f"Removing existing output directory: {OUT}")
+    shutil.rmtree(OUT)
+
+(OUT / "tiles").mkdir(parents=True)
+
+
+# ============================================================
+# FLAT ELEVATION
+# ============================================================
+
+# Every building starts from the same horizontal base plane.
+elev = {}
+
+# ============================================================
+# LOAD BUILDINGS
+# ============================================================
+
+gdf = gpd.read_file(INPUT)
+
+if gdf.crs is None:
+    raise SystemExit(
+        "The input GeoJSON has no CRS information. "
+        "This workflow expects EPSG:3857."
+    )
+
+if gdf.crs.to_epsg() != 3857:
+    raise SystemExit(
+        f"Input CRS is {gdf.crs}, but this workflow expects EPSG:3857. "
+        "Reproject the GeoJSON before running the converter."
+    )
+
+required_columns = {"id", "height", "var", "source", "region", "geometry"}
+missing_columns = required_columns - set(gdf.columns)
+
+if missing_columns:
+    raise SystemExit(
+        "Missing required GeoJSON fields: "
+        + ", ".join(sorted(missing_columns))
+    )
+
+gdf = gdf[
+    gdf.geometry.notna() & ~gdf.geometry.is_empty
+].copy()
+
+if len(gdf) == 0:
+    raise SystemExit("The input GeoJSON contains no valid geometries.")
+
+gdf["height"] = (
+    gdf["height"]
+    .astype(float)
+    .fillna(0)
+    .clip(lower=MIN_HEIGHT)
+)
+
+gdf["_id"] = gdf["id"].astype(str)
+
+gdf["terrain_height"] = 0.0
+
+print(f"Buildings loaded: {len(gdf):,}")
+print("Elevation mode: flat")
+
+
+# ============================================================
+# COORDINATE TRANSFORMERS
+# ============================================================
+
+Txy = Transformer.from_crs(
+    "EPSG:3857",
+    "EPSG:4326",
+    always_xy=True
+)
+
+Tecef = Transformer.from_crs(
+    "EPSG:4326",
+    "EPSG:4978",
+    always_xy=True
+)
+
+
+# ============================================================
+# LOCAL ENU COORDINATE FRAME
+# ============================================================
+
+def center_frame(x, y):
+    lon, lat = Txy.transform(x, y)
+
+    X, Y, Z = Tecef.transform(lon, lat, 0.0)
+    c = np.array([X, Y, Z], float)
+
+    la = math.radians(lat)
+    lo = math.radians(lon)
+    scale = math.cos(la)
+
+    ex, ey, ez = (
+        -math.sin(lo) * scale,
+        math.cos(lo) * scale,
+        0.0
+    )
+
+    nx, ny, nz = (
+        -math.sin(la) * math.cos(lo) * scale,
+        -math.sin(la) * math.sin(lo) * scale,
+        math.cos(la) * scale
+    )
+
+    ux, uy, uz = (
+        math.cos(la) * math.cos(lo),
+        math.cos(la) * math.sin(lo),
+        math.sin(la)
+    )
+
+    return c, (
+        ex, ey, ez,
+        nx, ny, nz,
+        ux, uy, uz
+    )
+
+
+def local_vec(x, y, z, cx, cy, frame):
+    c, m = frame
+
+    ex, ey, ez, nx, ny, nz, ux, uy, uz = m
+
+    dx = x - cx
+    dy = y - cy
+
+    return (
+        dx * ex + dy * nx + z * ux,
+        dx * ey + dy * ny + z * uy,
+        dx * ez + dy * nz + z * uz,
+    )
+
+
+# ============================================================
+# TRIANGULATION / WINDING HELPERS
+# ============================================================
+
+def _cross(a, b, c):
+    return (
+        (b[0] - a[0]) * (c[1] - a[1])
+        - (b[1] - a[1]) * (c[0] - a[0])
+    )
+
+
+def _inside(p, a, b, c):
+    c1 = _cross(a, b, p)
+    c2 = _cross(b, c, p)
+    c3 = _cross(c, a, p)
+
+    return (
+        c1 >= -1e-12
+        and c2 >= -1e-12
+        and c3 >= -1e-12
+    ) or (
+        c1 <= 1e-12
+        and c2 <= 1e-12
+        and c3 <= 1e-12
+    )
+
+
+def _area(pts):
+    return sum(
+        pts[i][0] * pts[(i + 1) % len(pts)][1]
+        - pts[(i + 1) % len(pts)][0] * pts[i][1]
+        for i in range(len(pts))
+    ) / 2
+
+
+def ring_points_normalized(ring, want_ccw):
+    pts = list(ring.coords)[:-1]
+
+    if len(pts) < 3:
+        return pts
+
+    a = _area(pts)
+
+    if (a > 0) != want_ccw:
+        pts.reverse()
+
+    return pts
+
+
+def normalize_tri(t, want_ccw=True):
+    p = list(t)
+    a = _area(p)
+
+    if (a > 0) != want_ccw:
+        p[1], p[2] = p[2], p[1]
+
+    return tuple(p)
+
+
+def earclip(poly):
+    """
+    Triangulate a polygon.
+
+    Polygons with interior rings use Shapely triangulation with a
+    point-in-polygon filter. Simple polygons use an ear-clipping
+    implementation.
+    """
+    if len(poly.interiors):
+        out = []
+
+        for t in triangulate(poly):
+            rp = t.representative_point()
+
+            if poly.contains(rp) or poly.touches(rp):
+                p = list(t.exterior.coords)[:3]
+                out.append(normalize_tri(p, True))
+
+        return out
+
+    pts = list(poly.exterior.coords)[:-1]
+
+    if len(pts) < 3:
+        return []
+
+    if _area(pts) < 0:
+        pts.reverse()
+
+    idx = list(range(len(pts)))
+    out = []
+    guard = 0
+
+    while (
+        len(idx) > 3
+        and guard < len(pts) * len(pts) * 2
+    ):
+        guard += 1
+        found = False
+        m = len(idx)
+
+        for j in range(m):
+            ia = idx[(j - 1) % m]
+            ib = idx[j]
+            ic = idx[(j + 1) % m]
+
+            a = pts[ia]
+            b = pts[ib]
+            c = pts[ic]
+
+            if _cross(a, b, c) <= 1e-12:
+                continue
+
+            ok = True
+
+            for k in idx:
+                if k in (ia, ib, ic):
+                    continue
+
+                if _inside(pts[k], a, b, c):
+                    ok = False
+                    break
+
+            if ok:
+                out.append((a, b, c))
+                del idx[j]
+                found = True
+                break
+
+        if not found:
+            break
+
+    if len(idx) == 3:
+        out.append(
+            (
+                pts[idx[0]],
+                pts[idx[1]],
+                pts[idx[2]]
+            )
+        )
+
+    if not out and len(pts) >= 3:
+        out = [
+            (pts[0], pts[i], pts[i + 1])
+            for i in range(1, len(pts) - 1)
+        ]
+
+    return out
+
+
+# ============================================================
+# B3DM TILE GENERATION
+# ============================================================
+
+def make_tile(features, path):
+    centroids = [
+        f.geometry.centroid
+        for f in features
+    ]
+
+    cx = float(
+        np.mean([c.x for c in centroids])
+    )
+
+    cy = float(
+        np.mean([c.y for c in centroids])
+    )
+
+    frame = center_frame(cx, cy)
+
+    verts = []
+    bids = []
+    inds = []
+    props = []
+
+    tile_min = 1e99
+    tile_max = -1e99
+
+    def tri(a, b, c, bid):
+        k = len(verts)
+
+        verts.extend([a, b, c])
+        bids.extend([bid, bid, bid])
+        inds.extend([k, k + 1, k + 2])
+
+    for bid, f in enumerate(features):
+        poly = f.geometry
+        h = float(f.height)
+
+        base = float(f.terrain_height)
+        top = base + h
+
+        tile_min = min(tile_min, base)
+        tile_max = max(tile_max, top)
+
+        # ----------------------------------------------------
+        # Top and bottom faces
+        # ----------------------------------------------------
+
+        for t in earclip(poly):
+            b = [
+                local_vec(
+                    p[0], p[1], base,
+                    cx, cy, frame
+                )
+                for p in t
+            ]
+
+            q = [
+                local_vec(
+                    p[0], p[1], top,
+                    cx, cy, frame
+                )
+                for p in t
+            ]
+
+            # Bottom face: reverse winding.
+            tri(b[0], b[2], b[1], bid)
+
+            # Top face: CCW.
+            tri(q[0], q[1], q[2], bid)
+
+        # ----------------------------------------------------
+        # Vertical side walls
+        # ----------------------------------------------------
+
+        # Force exterior CCW and interior CW so side-face
+        # winding is deterministic.
+        rings = [
+            (poly.exterior, True),
+            *[
+                (r, False)
+                for r in poly.interiors
+            ]
+        ]
+
+        for ring, want_ccw in rings:
+            pts = ring_points_normalized(
+                ring,
+                want_ccw
+            )
+
+            pts = pts + [pts[0]] if pts else pts
+
+            for a, b in zip(
+                pts[:-1],
+                pts[1:]
+            ):
+                p0 = local_vec(
+                    a[0], a[1], base,
+                    cx, cy, frame
+                )
+
+                p1 = local_vec(
+                    b[0], b[1], base,
+                    cx, cy, frame
+                )
+
+                q0 = local_vec(
+                    a[0], a[1], top,
+                    cx, cy, frame
+                )
+
+                q1 = local_vec(
+                    b[0], b[1], top,
+                    cx, cy, frame
+                )
+
+                # Two triangles per wall segment.
+                tri(p0, p1, q1, bid)
+                tri(p0, q1, q0, bid)
+
+        props.append({
+            "id": str(f["id"]),
+            "height": h,
+            "var": (
+                None
+                if f["var"] is None
+                else float(f["var"])
+            ),
+            "source": str(f["source"]),
+            "region": str(f["region"])
+        })
+
+    if not verts:
+        raise RuntimeError(
+            "Tile contains no generated vertices."
+        )
+
+    pos = np.asarray(
+        verts,
+        np.float32
+    )
+
+    bi = np.asarray(
+        bids,
+        np.uint16
+    )
+
+    ind = np.asarray(
+        inds,
+        np.uint32
+    )
+
+    # --------------------------------------------------------
+    # Build aligned GLB binary buffers
+    # --------------------------------------------------------
+
+    pb = pos.tobytes()
+    bb = bi.tobytes()
+    ib = ind.tobytes()
+
+    ob = (len(pb) + 3) // 4 * 4
+    oi = (ob + len(bb) + 3) // 4 * 4
+
+    raw = bytearray(oi + len(ib))
+
+    raw[:len(pb)] = pb
+    raw[ob:ob + len(bb)] = bb
+    raw[oi:oi + len(ib)] = ib
+
+    raw = bytes(raw)
+
+    gltf = {
+        "asset": {
+            "version": "2.0"
+        },
+
+        "scene": 0,
+
+        "scenes": [
+            {"nodes": [0]}
+        ],
+
+        "nodes": [
+            {
+                "mesh": 0,
+
+                # =================================================
+                # V4 MATRIX — DO NOT CHANGE
+                # =================================================
+                "matrix": [
+                    1, 0, 0, 0,
+                    0, 0, -1, 0,
+                    0, 1, 0, 0,
+                    0, 0, 0, 1
+                ]
+            }
+        ],
+
+        "meshes": [
+            {
+                "primitives": [
+                    {
+                        "attributes": {
+                            "POSITION": 0,
+                            "_BATCHID": 1
+                        },
+                        "indices": 2,
+                        "mode": 4,
+                        "material": 0
+                    }
+                ]
+            }
+        ],
+
+        "materials": [
+            {
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [
+                        0.72, 0.72, 0.72, 1.0
+                    ],
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 0.85
+                }
+            }
+        ],
+
+        "buffers": [
+            {
+                "byteLength": len(raw)
+            }
+        ],
+
+        "bufferViews": [
+            {
+                "buffer": 0,
+                "byteOffset": 0,
+                "byteLength": len(pb),
+                "target": 34962
+            },
+            {
+                "buffer": 0,
+                "byteOffset": ob,
+                "byteLength": len(bb),
+                "target": 34962
+            },
+            {
+                "buffer": 0,
+                "byteOffset": oi,
+                "byteLength": len(ib),
+                "target": 34963
+            }
+        ],
+
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": len(pos),
+                "type": "VEC3",
+                "min": pos.min(0).tolist(),
+                "max": pos.max(0).tolist()
+            },
+            {
+                "bufferView": 1,
+                "componentType": 5123,
+                "count": len(bi),
+                "type": "SCALAR",
+                "min": [0],
+                "max": [len(features) - 1]
+            },
+            {
+                "bufferView": 2,
+                "componentType": 5125,
+                "count": len(ind),
+                "type": "SCALAR",
+                "min": [0],
+                "max": [len(pos) - 1]
+            }
+        ]
+    }
+
+    # --------------------------------------------------------
+    # Pack GLB
+    # --------------------------------------------------------
+
+    j = json.dumps(
+        gltf,
+        separators=(",", ":")
+    ).encode()
+
+    j += b" " * ((-len(j)) % 4)
+
+    rb = (
+        raw
+        + b"\0" * ((-len(raw)) % 4)
+    )
+
+    glb = (
+        struct.pack(
+            "<4sII",
+            b"glTF",
+            2,
+            12 + 8 + len(j) + 8 + len(rb)
+        )
+        + struct.pack(
+            "<II",
+            len(j),
+            0x4E4F534A
+        )
+        + j
+        + struct.pack(
+            "<II",
+            len(rb),
+            0x004E4942
+        )
+        + rb
+    )
+
+    # --------------------------------------------------------
+    # 3D Tiles feature and batch tables
+    # --------------------------------------------------------
+
+    ft = json.dumps(
+        {
+            "BATCH_LENGTH": len(props),
+            "RTC_CENTER": frame[0].tolist()
+        },
+        separators=(",", ":")
+    ).encode()
+
+    ft += b" " * ((-len(ft)) % 4)
+
+    bt = json.dumps(
+        {
+            k: [p[k] for p in props]
+            for k in [
+                "id",
+                "height",
+                "var",
+                "source",
+                "region"
+            ]
+        },
+        separators=(",", ":")
+    ).encode()
+
+    bt += b" " * ((-len(bt)) % 4)
+
+    total = (
+        28
+        + len(ft)
+        + len(bt)
+        + len(glb)
+    )
+
+    header = struct.pack(
+        "<4sIIIIII",
+        b"b3dm",
+        1,
+        total,
+        len(ft),
+        0,
+        len(bt),
+        0
+    )
+
+    path.write_bytes(
+        header
+        + ft
+        + bt
+        + glb
+    )
+
+    return tile_min, tile_max
+
+
+# ============================================================
+# SPATIAL TILING
+# ============================================================
+
+cent = gdf.geometry.centroid
+
+minx, miny, maxx, maxy = map(
+    float,
+    gdf.total_bounds
+)
+
+sx = (maxx - minx) / NX
+sy = (maxy - miny) / NY
+
+ix = (
+    ((cent.x - minx) / sx)
+    .astype(int)
+    .clip(0, NX - 1)
+)
+
+iy = (
+    ((cent.y - miny) / sy)
+    .astype(int)
+    .clip(0, NY - 1)
+)
+
+gdf["_ix"] = ix
+gdf["_iy"] = iy
+
+bins = gdf.groupby(
+    ["_ix", "_iy"],
+    sort=True
+)
+
+children = []
+
+for n, ((ix, iy), grp) in enumerate(
+    bins,
+    1
+):
+    features = [
+        row
+        for _, row
+        in grp.iterrows()
+    ]
+
+    name = f"tile_{ix}_{iy}.b3dm"
+    outp = OUT / "tiles" / name
+
+    tile_min, tile_max = make_tile(
+        features,
+        outp
+    )
+
+    x0 = minx + ix * sx
+    x1 = minx + (ix + 1) * sx
+
+    y0 = miny + iy * sy
+    y1 = miny + (iy + 1) * sy
+
+    west, south = Txy.transform(
+        x0, y0
+    )
+
+    east, north = Txy.transform(
+        x1, y1
+    )
+
+    children.append(
+        {
+            "boundingVolume": {
+                "region": [
+                    math.radians(west),
+                    math.radians(south),
+                    math.radians(east),
+                    math.radians(north),
+                    tile_min,
+                    tile_max
+                ]
+            },
+
+            "geometricError": 0,
+
+            "content": {
+                "uri": f"tiles/{name}"
+            }
+        }
+    )
+
+    if n % 25 == 0:
+        print(
+            f"{n}/{len(bins)} tiles",
+            flush=True
+        )
+
+
+# ============================================================
+# TILESET METADATA
+# ============================================================
+
+west, south = Txy.transform(
+    minx, miny
+)
+
+east, north = Txy.transform(
+    maxx, maxy
+)
+
+root = {
+    "boundingVolume": {
+        "region": [
+            math.radians(west),
+            math.radians(south),
+            math.radians(east),
+            math.radians(north),
+            float(gdf.terrain_height.min()),
+            float(
+                (
+                    gdf.terrain_height
+                    + gdf.height
+                ).max()
+            )
+        ]
+    },
+
+    "geometricError": 1000,
+
+    "refine": "ADD",
+
+    "children": children
+}
+
+(OUT / "tileset.json").write_text(
+    json.dumps(
+        {
+            "asset": {
+                "version": "1.0"
+            },
+            "geometricError": 1000,
+            "root": root
+        },
+        indent=2
+    ),
+    encoding="utf-8"
+)
+
+(OUT / "conversion_info.json").write_text(
+    json.dumps(
+        {
+            "features": len(gdf),
+            "tiles": len(children),
+            "grid": [NX, NY],
+            "crs": "EPSG:3857",
+            "height_field": "height",
+            "elevation_mode": "flat",
+            "terrain": None,
+            "terrain_method": None,
+            "height_reference": "0.0 metre common base plane",
+            "winding": (
+                "CCW caps; normalized exterior "
+                "CCW / interior CW side rings"
+            ),
+            "coordinate_fix": (
+                "v4 glTF node rotation matrix retained: "
+                "(x,y,z)->(x,z,-y)"
+            ),
+            "metadata": [
+                "id",
+                "height",
+                "var",
+                "source",
+                "region"
+            ]
+        },
+        indent=2
+    ),
+    encoding="utf-8"
+)
+
+print()
+print("=" * 60)
+print("DONE")
+print("=" * 60)
+print(f"Buildings: {len(gdf):,}")
+print(f"Tiles:     {len(children):,}")
+print(f"Output:    {OUT}")
+print()
+print(f"Tileset:   {OUT / 'tileset.json'}")

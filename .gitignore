@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+.venv/
+venv/
+env/
+
+output/*
+!output/.gitkeep
+
+data/terrain_elevations.json
+data/*_centroids.json
+!data/sample_building_centroids.json
+
+.DS_Store
+Thumbs.db
