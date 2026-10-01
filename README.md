@@ -48,7 +48,7 @@ Start with the **Flat** workflow. The repository already contains sample data, s
 
 ```bash
 git clone https://github.com/PeiChiTsai/geojson-buildings-to-3dtiles.git
-cd building-footprints-to-3dtiles
+cd geojson-buildings-to-3dtiles
 ```
 
 ### 2. Create a virtual environment
