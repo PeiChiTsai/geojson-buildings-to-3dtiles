@@ -7,6 +7,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 from pyproj import Transformer
 from shapely.ops import triangulate
 
@@ -89,6 +90,14 @@ if MIN_HEIGHT < 0:
     raise SystemExit("--min-height must be >= 0.")
 
 if OUT.exists():
+    # Only wipe a previous tileset output (or an empty directory),
+    # never an arbitrary directory passed by mistake (e.g. --out data).
+    if any(OUT.iterdir()) and not (OUT / "tileset.json").exists():
+        raise SystemExit(
+            f"Refusing to delete {OUT}: it is not empty and has no "
+            "tileset.json. Choose a new or previous output directory."
+        )
+
     print(f"Removing existing output directory: {OUT}")
     shutil.rmtree(OUT)
 
@@ -132,6 +141,10 @@ if missing_columns:
 gdf = gdf[
     gdf.geometry.notna() & ~gdf.geometry.is_empty
 ].copy()
+
+# Split MultiPolygons into one Polygon per row. Each part keeps the
+# original attributes (including id).
+gdf = gdf.explode(index_parts=False, ignore_index=True)
 
 if len(gdf) == 0:
     raise SystemExit("The input GeoJSON contains no valid geometries.")
@@ -497,7 +510,7 @@ def make_tile(features, path):
             "height": h,
             "var": (
                 None
-                if f["var"] is None
+                if pd.isna(f["var"])
                 else float(f["var"])
             ),
             "source": str(f["source"]),
@@ -715,7 +728,8 @@ def make_tile(features, path):
                 "region"
             ]
         },
-        separators=(",", ":")
+        separators=(",", ":"),
+        allow_nan=False
     ).encode()
 
     bt += b" " * ((-len(bt)) % 4)
@@ -802,11 +816,9 @@ for n, ((ix, iy), grp) in enumerate(
         outp
     )
 
-    x0 = minx + ix * sx
-    x1 = minx + (ix + 1) * sx
-
-    y0 = miny + iy * sy
-    y1 = miny + (iy + 1) * sy
+    # Buildings are binned by centroid and can extend past their
+    # grid cell, so bound the tile by its actual footprints.
+    x0, y0, x1, y1 = map(float, grp.total_bounds)
 
     west, south = Txy.transform(
         x0, y0
