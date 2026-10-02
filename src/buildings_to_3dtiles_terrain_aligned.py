@@ -9,7 +9,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
-from shapely.ops import triangulate
+import shapely
 
 
 # ============================================================
@@ -109,12 +109,18 @@ if MIN_HEIGHT < 0:
     raise SystemExit("--min-height must be >= 0.")
 
 if OUT.exists():
-    # Only wipe a previous tileset output (or an empty directory),
-    # never an arbitrary directory passed by mistake (e.g. --out data).
-    if any(OUT.iterdir()) and not (OUT / "tileset.json").exists():
+    # Only wipe a previous output (finished, or a failed run that left
+    # just tiles/) or an empty directory, never an arbitrary directory
+    # passed by mistake (e.g. --out data).
+    looks_like_output = (
+        (OUT / "tileset.json").exists() or (OUT / "tiles").is_dir()
+    )
+
+    if any(OUT.iterdir()) and not looks_like_output:
         raise SystemExit(
             f"Refusing to delete {OUT}: it is not empty and has no "
-            "tileset.json. Choose a new or previous output directory."
+            "tileset.json or tiles/. Choose a new or previous output "
+            "directory."
         )
 
     print(f"Removing existing output directory: {OUT}")
@@ -173,9 +179,15 @@ gdf = gdf[
     gdf.geometry.notna() & ~gdf.geometry.is_empty
 ].copy()
 
+# Repair invalid (e.g. self-intersecting) footprints, which the
+# triangulation rejects.
+gdf["geometry"] = gdf.geometry.make_valid()
+
 # Split MultiPolygons into one Polygon per row. Each part keeps the
-# original attributes (including id).
+# original attributes (including id). make_valid can also produce
+# lines or points from degenerate footprints; drop those.
 gdf = gdf.explode(index_parts=False, ignore_index=True)
+gdf = gdf[gdf.geom_type == "Polygon"].copy()
 
 if len(gdf) == 0:
     raise SystemExit("The input GeoJSON contains no valid geometries.")
@@ -285,29 +297,6 @@ def local_vec(x, y, z, cx, cy, frame):
 # TRIANGULATION / WINDING HELPERS
 # ============================================================
 
-def _cross(a, b, c):
-    return (
-        (b[0] - a[0]) * (c[1] - a[1])
-        - (b[1] - a[1]) * (c[0] - a[0])
-    )
-
-
-def _inside(p, a, b, c):
-    c1 = _cross(a, b, p)
-    c2 = _cross(b, c, p)
-    c3 = _cross(c, a, p)
-
-    return (
-        c1 >= -1e-12
-        and c2 >= -1e-12
-        and c3 >= -1e-12
-    ) or (
-        c1 <= 1e-12
-        and c2 <= 1e-12
-        and c3 <= 1e-12
-    )
-
-
 def _area(pts):
     return sum(
         pts[i][0] * pts[(i + 1) % len(pts)][1]
@@ -340,93 +329,15 @@ def normalize_tri(t, want_ccw=True):
     return tuple(p)
 
 
-def earclip(poly):
+def triangulate_polygon(poly):
     """
-    Triangulate a polygon.
-
-    Polygons with interior rings use Shapely triangulation with a
-    point-in-polygon filter. Simple polygons use an ear-clipping
-    implementation.
+    Triangulate a polygon (concave shapes and holes supported) into
+    CCW triangles.
     """
-    if len(poly.interiors):
-        out = []
-
-        for t in triangulate(poly):
-            rp = t.representative_point()
-
-            if poly.contains(rp) or poly.touches(rp):
-                p = list(t.exterior.coords)[:3]
-                out.append(normalize_tri(p, True))
-
-        return out
-
-    pts = list(poly.exterior.coords)[:-1]
-
-    if len(pts) < 3:
-        return []
-
-    if _area(pts) < 0:
-        pts.reverse()
-
-    idx = list(range(len(pts)))
-    out = []
-    guard = 0
-
-    while (
-        len(idx) > 3
-        and guard < len(pts) * len(pts) * 2
-    ):
-        guard += 1
-        found = False
-        m = len(idx)
-
-        for j in range(m):
-            ia = idx[(j - 1) % m]
-            ib = idx[j]
-            ic = idx[(j + 1) % m]
-
-            a = pts[ia]
-            b = pts[ib]
-            c = pts[ic]
-
-            if _cross(a, b, c) <= 1e-12:
-                continue
-
-            ok = True
-
-            for k in idx:
-                if k in (ia, ib, ic):
-                    continue
-
-                if _inside(pts[k], a, b, c):
-                    ok = False
-                    break
-
-            if ok:
-                out.append((a, b, c))
-                del idx[j]
-                found = True
-                break
-
-        if not found:
-            break
-
-    if len(idx) == 3:
-        out.append(
-            (
-                pts[idx[0]],
-                pts[idx[1]],
-                pts[idx[2]]
-            )
-        )
-
-    if not out and len(pts) >= 3:
-        out = [
-            (pts[0], pts[i], pts[i + 1])
-            for i in range(1, len(pts) - 1)
-        ]
-
-    return out
+    return [
+        normalize_tri(list(t.exterior.coords)[:3], True)
+        for t in shapely.constrained_delaunay_triangles(poly).geoms
+    ]
 
 
 # ============================================================
@@ -434,6 +345,13 @@ def earclip(poly):
 # ============================================================
 
 def make_tile(features, path):
+    # _BATCHID is stored as uint16.
+    if len(features) > 65536:
+        raise SystemExit(
+            f"{path.name} has {len(features):,} buildings, but a tile "
+            "can hold at most 65,536. Increase --nx / --ny."
+        )
+
     centroids = [
         f.geometry.centroid
         for f in features
@@ -478,7 +396,7 @@ def make_tile(features, path):
         # Top and bottom faces
         # ----------------------------------------------------
 
-        for t in earclip(poly):
+        for t in triangulate_polygon(poly):
             b = [
                 local_vec(
                     p[0], p[1], base,
