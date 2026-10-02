@@ -31,7 +31,7 @@ button {
   padding: 8px;
 }
 
-input[type=text] {
+input[type=password] {
   width: 100%;
   box-sizing: border-box;
 }
@@ -64,7 +64,7 @@ button {
 
 <input
   id="token"
-  type="text"
+  type="password"
   placeholder="Paste your Cesium ion token here"
 />
 
@@ -275,7 +275,8 @@ async function sample() {
 
   a.click();
 
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 
   setStatus(
     `Done.\n` +
