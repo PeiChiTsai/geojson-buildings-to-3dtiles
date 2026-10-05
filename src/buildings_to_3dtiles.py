@@ -22,161 +22,6 @@ DEFAULT_OUTPUT_DIR = PROJECT_DIR / "output"
 
 
 # ============================================================
-# ARGUMENTS
-# ============================================================
-
-parser = argparse.ArgumentParser(
-    description=(
-        "Convert building footprint GeoJSON into flat 3D Tiles."
-    )
-)
-
-parser.add_argument(
-    "--input",
-    type=Path,
-    default=DEFAULT_DATA_DIR / "sample_buildings.geojson",
-    help="Input building footprint GeoJSON."
-)
-
-parser.add_argument(
-    "--out",
-    type=Path,
-    default=DEFAULT_OUTPUT_DIR / "my_city_flat",
-    help="Output directory for the generated 3D Tiles."
-)
-
-parser.add_argument(
-    "--nx",
-    type=int,
-    default=16,
-    help="Number of tiles along the X direction."
-)
-
-parser.add_argument(
-    "--ny",
-    type=int,
-    default=16,
-    help="Number of tiles along the Y direction."
-)
-
-parser.add_argument(
-    "--min-height",
-    type=float,
-    default=0.02,
-    help="Minimum building height in metres."
-)
-
-args = parser.parse_args()
-
-INPUT = args.input
-OUT = args.out
-
-NX = args.nx
-NY = args.ny
-MIN_HEIGHT = args.min_height
-
-
-# ============================================================
-# INPUT VALIDATION
-# ============================================================
-
-if not INPUT.exists():
-    raise SystemExit(f"Missing input GeoJSON: {INPUT}")
-
-if NX < 1 or NY < 1:
-    raise SystemExit("--nx and --ny must both be >= 1.")
-
-if MIN_HEIGHT < 0:
-    raise SystemExit("--min-height must be >= 0.")
-
-if OUT.exists():
-    # Only wipe a previous output (finished, or a failed run that left
-    # just tiles/) or an empty directory, never an arbitrary directory
-    # passed by mistake (e.g. --out data).
-    looks_like_output = (
-        (OUT / "tileset.json").exists() or (OUT / "tiles").is_dir()
-    )
-
-    if any(OUT.iterdir()) and not looks_like_output:
-        raise SystemExit(
-            f"Refusing to delete {OUT}: it is not empty and has no "
-            "tileset.json or tiles/. Choose a new or previous output "
-            "directory."
-        )
-
-    print(f"Removing existing output directory: {OUT}")
-    shutil.rmtree(OUT)
-
-(OUT / "tiles").mkdir(parents=True)
-
-
-# ============================================================
-# FLAT ELEVATION
-# ============================================================
-
-# Every building starts from the same horizontal base plane.
-elev = {}
-
-# ============================================================
-# LOAD BUILDINGS
-# ============================================================
-
-gdf = gpd.read_file(INPUT)
-
-if gdf.crs is None:
-    raise SystemExit(
-        "The input GeoJSON has no CRS information. "
-        "This workflow expects EPSG:3857."
-    )
-
-if gdf.crs.to_epsg() != 3857:
-    raise SystemExit(
-        f"Input CRS is {gdf.crs}, but this workflow expects EPSG:3857. "
-        "Reproject the GeoJSON before running the converter."
-    )
-
-required_columns = {"id", "height", "var", "source", "region", "geometry"}
-missing_columns = required_columns - set(gdf.columns)
-
-if missing_columns:
-    raise SystemExit(
-        "Missing required GeoJSON fields: "
-        + ", ".join(sorted(missing_columns))
-    )
-
-gdf = gdf[
-    gdf.geometry.notna() & ~gdf.geometry.is_empty
-].copy()
-
-# Repair invalid (e.g. self-intersecting) footprints, which the
-# triangulation rejects.
-gdf["geometry"] = gdf.geometry.make_valid()
-
-# Split MultiPolygons into one Polygon per row. Each part keeps the
-# original attributes (including id). make_valid can also produce
-# lines or points from degenerate footprints; drop those.
-gdf = gdf.explode(index_parts=False, ignore_index=True)
-gdf = gdf[gdf.geom_type == "Polygon"].copy()
-
-if len(gdf) == 0:
-    raise SystemExit("The input GeoJSON contains no valid geometries.")
-
-gdf["height"] = (
-    gdf["height"]
-    .astype(float)
-    .fillna(0)
-    .clip(lower=MIN_HEIGHT)
-)
-
-gdf["_id"] = gdf["id"].astype(str)
-
-gdf["terrain_height"] = 0.0
-
-print(f"Buildings loaded: {len(gdf):,}")
-print("Elevation mode: flat")
-
-
-# ============================================================
 # COORDINATE TRANSFORMERS
 # ============================================================
 
@@ -292,6 +137,11 @@ def triangulate_polygon(poly):
         normalize_tri(list(t.exterior.coords)[:3], True)
         for t in shapely.constrained_delaunay_triangles(poly).geoms
     ]
+
+
+def _str_or_none(v):
+    # Null text attributes become JSON null instead of "nan".
+    return None if pd.isna(v) else str(v)
 
 
 # ============================================================
@@ -424,15 +274,15 @@ def make_tile(features, path):
                 tri(p0, q1, q0, bid)
 
         props.append({
-            "id": str(f["id"]),
+            "id": _str_or_none(f["id"]),
             "height": h,
             "var": (
                 None
                 if pd.isna(f["var"])
                 else float(f["var"])
             ),
-            "source": str(f["source"]),
-            "region": str(f["region"])
+            "source": _str_or_none(f["source"]),
+            "region": _str_or_none(f["region"])
         })
 
     if not verts:
@@ -681,188 +531,417 @@ def make_tile(features, path):
 
 
 # ============================================================
-# SPATIAL TILING
+# ARGUMENTS
 # ============================================================
 
-cent = gdf.geometry.centroid
-
-minx, miny, maxx, maxy = map(
-    float,
-    gdf.total_bounds
-)
-
-sx = (maxx - minx) / NX
-sy = (maxy - miny) / NY
-
-ix = (
-    ((cent.x - minx) / sx)
-    .astype(int)
-    .clip(0, NX - 1)
-)
-
-iy = (
-    ((cent.y - miny) / sy)
-    .astype(int)
-    .clip(0, NY - 1)
-)
-
-gdf["_ix"] = ix
-gdf["_iy"] = iy
-
-bins = gdf.groupby(
-    ["_ix", "_iy"],
-    sort=True
-)
-
-children = []
-
-for n, ((ix, iy), grp) in enumerate(
-    bins,
-    1
-):
-    features = [
-        row
-        for _, row
-        in grp.iterrows()
-    ]
-
-    name = f"tile_{ix}_{iy}.b3dm"
-    outp = OUT / "tiles" / name
-
-    tile_min, tile_max = make_tile(
-        features,
-        outp
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert building footprint GeoJSON into 3D Tiles. "
+            "Buildings sit on a flat 0 m base plane, or on Cesium World "
+            "Terrain when --terrain is given."
+        )
     )
 
-    # Buildings are binned by centroid and can extend past their
-    # grid cell, so bound the tile by its actual footprints.
-    x0, y0, x1, y1 = map(float, grp.total_bounds)
-
-    west, south = Txy.transform(
-        x0, y0
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=DEFAULT_DATA_DIR / "sample_buildings.geojson",
+        help="Input building footprint GeoJSON."
     )
 
-    east, north = Txy.transform(
-        x1, y1
+    parser.add_argument(
+        "--terrain",
+        type=Path,
+        help=(
+            "Terrain elevation JSON generated by "
+            "terrain/sample_cesium_world_terrain.html. "
+            "Omit for flat output."
+        )
     )
 
-    children.append(
-        {
-            "boundingVolume": {
-                "region": [
-                    math.radians(west),
-                    math.radians(south),
-                    math.radians(east),
-                    math.radians(north),
-                    tile_min,
-                    tile_max
-                ]
-            },
-
-            "geometricError": 0,
-
-            "content": {
-                "uri": f"tiles/{name}"
-            }
-        }
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help=(
+            "Output directory for the generated 3D Tiles. Defaults to "
+            "output/my_city_flat or output/my_city_terrain_aligned."
+        )
     )
 
-    if n % 25 == 0:
-        print(
-            f"{n}/{len(bins)} tiles",
-            flush=True
+    parser.add_argument(
+        "--nx",
+        type=int,
+        default=16,
+        help="Number of tiles along the X direction."
+    )
+
+    parser.add_argument(
+        "--ny",
+        type=int,
+        default=16,
+        help="Number of tiles along the Y direction."
+    )
+
+    parser.add_argument(
+        "--min-height",
+        type=float,
+        default=0.02,
+        help="Minimum building height in metres."
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    args = parse_args()
+
+    out = args.out or DEFAULT_OUTPUT_DIR / (
+        "my_city_terrain_aligned" if args.terrain else "my_city_flat"
+    )
+
+    nx = args.nx
+    ny = args.ny
+
+    # ============================================================
+    # args.input VALIDATION
+    # ============================================================
+
+    if not args.input.exists():
+        raise SystemExit(f"Missing input GeoJSON: {args.input}")
+
+    if args.terrain and not args.terrain.exists():
+        raise SystemExit(
+            f"Missing terrain file: {args.terrain}\n"
+            "Run terrain/sample_cesium_world_terrain.html first."
         )
 
+    if nx < 1 or ny < 1:
+        raise SystemExit("--nx and --ny must both be >= 1.")
 
-# ============================================================
-# TILESET METADATA
-# ============================================================
+    if args.min_height < 0:
+        raise SystemExit("--min-height must be >= 0.")
 
-west, south = Txy.transform(
-    minx, miny
-)
+    if out.exists():
+        # Only wipe a previous output (finished, or a failed run that left
+        # just tiles/) or an empty directory, never an arbitrary directory
+        # passed by mistake (e.g. --out data).
+        looks_like_output = (
+            (out / "tileset.json").exists() or (out / "tiles").is_dir()
+        )
 
-east, north = Txy.transform(
-    maxx, maxy
-)
-
-root = {
-    "boundingVolume": {
-        "region": [
-            math.radians(west),
-            math.radians(south),
-            math.radians(east),
-            math.radians(north),
-            float(gdf.terrain_height.min()),
-            float(
-                (
-                    gdf.terrain_height
-                    + gdf.height
-                ).max()
+        if any(out.iterdir()) and not looks_like_output:
+            raise SystemExit(
+                f"Refusing to delete {out}: it is not empty and has no "
+                "tileset.json or tiles/. Choose a new or previous output "
+                "directory."
             )
+
+        print(f"Removing existing output directory: {out}")
+        shutil.rmtree(out)
+
+    (out / "tiles").mkdir(parents=True)
+
+    # ============================================================
+    # LOAD BUILDINGS
+    # ============================================================
+
+    gdf = gpd.read_file(args.input)
+
+    if gdf.crs is None:
+        raise SystemExit(
+            "The input GeoJSON has no CRS information. "
+            "This workflow expects EPSG:3857."
+        )
+
+    if gdf.crs.to_epsg() != 3857:
+        raise SystemExit(
+            f"Input CRS is {gdf.crs}, but this workflow expects EPSG:3857. "
+            "Reproject the GeoJSON before running the converter."
+        )
+
+    required_columns = {"id", "height", "var", "source", "region", "geometry"}
+    missing_columns = required_columns - set(gdf.columns)
+
+    if missing_columns:
+        raise SystemExit(
+            "Missing required GeoJSON fields: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    gdf = gdf[
+        gdf.geometry.notna() & ~gdf.geometry.is_empty
+    ].copy()
+
+    # Repair invalid (e.g. self-intersecting) footprints, which the
+    # triangulation rejects.
+    gdf["geometry"] = gdf.geometry.make_valid()
+
+    # Split MultiPolygons into one Polygon per row. Each part keeps the
+    # original attributes (including id). make_valid can also produce
+    # lines or points from degenerate footprints; drop those.
+    gdf = gdf.explode(index_parts=False, ignore_index=True)
+    gdf = gdf[gdf.geom_type == "Polygon"].copy()
+
+    if len(gdf) == 0:
+        raise SystemExit("The input GeoJSON contains no valid geometries.")
+
+    gdf["height"] = (
+        gdf["height"]
+        .astype(float)
+        .fillna(0)
+        .clip(lower=args.min_height)
+    )
+
+    gdf["_id"] = gdf["id"].astype(str)
+
+    print(f"Buildings loaded: {len(gdf):,}")
+
+    # ============================================================
+    # ELEVATION
+    # ============================================================
+
+    if args.terrain:
+        terrain_data = json.loads(
+            args.terrain.read_text(encoding="utf-8")
+        )
+
+        elev = {
+            str(x["id"]): x.get("terrainHeight")
+            for x in terrain_data.get("elevations", [])
+        }
+
+        if not elev:
+            raise SystemExit(
+                f"{args.terrain} contains no elevations."
+            )
+
+        missing = [
+            x for x in gdf["_id"]
+            if x not in elev or elev[x] is None
         ]
-    },
 
-    "geometricError": 1000,
+        if missing:
+            raise SystemExit(
+                f"Missing terrain heights for {len(missing):,} buildings. "
+                "Re-run the terrain sampler. "
+                f"First IDs: {missing[:5]}"
+            )
 
-    "refine": "ADD",
+        gdf["terrain_height"] = gdf["_id"].map(
+            lambda x: float(elev[x])
+        )
 
-    "children": children
-}
+        elevation_info = {
+            "elevation_mode": "terrain-aligned",
+            "terrain": "Cesium World Terrain",
+            "terrain_method": (
+                "sampleTerrainMostDetailed at building centroid"
+            ),
+            "height_reference": "WGS84 ellipsoid height",
+        }
 
-(OUT / "tileset.json").write_text(
-    json.dumps(
-        {
-            "asset": {
-                "version": "1.0"
-            },
-            "geometricError": 1000,
-            "root": root
-        },
-        indent=2
-    ),
-    encoding="utf-8"
-)
+        print(f"Terrain elevations loaded: {len(elev):,}")
+    else:
+        # Every building starts from the same horizontal base plane.
+        gdf["terrain_height"] = 0.0
 
-(OUT / "conversion_info.json").write_text(
-    json.dumps(
-        {
-            "features": len(gdf),
-            "tiles": len(children),
-            "grid": [NX, NY],
-            "crs": "EPSG:3857",
-            "height_field": "height",
+        elevation_info = {
             "elevation_mode": "flat",
             "terrain": None,
             "terrain_method": None,
             "height_reference": "0.0 metre common base plane",
-            "winding": (
-                "CCW caps; normalized exterior "
-                "CCW / interior CW side rings"
-            ),
-            "coordinate_fix": (
-                "v4 glTF node rotation matrix retained: "
-                "(x,y,z)->(x,z,-y)"
-            ),
-            "metadata": [
-                "id",
-                "height",
-                "var",
-                "source",
-                "region"
+        }
+
+    print(f"Elevation mode: {elevation_info['elevation_mode']}")
+
+    # ============================================================
+    # SPATIAL TILING
+    # ============================================================
+
+    cent = gdf.geometry.centroid
+
+    minx, miny, maxx, maxy = map(
+        float,
+        gdf.total_bounds
+    )
+
+    sx = (maxx - minx) / nx
+    sy = (maxy - miny) / ny
+
+    ix = (
+        ((cent.x - minx) / sx)
+        .astype(int)
+        .clip(0, nx - 1)
+    )
+
+    iy = (
+        ((cent.y - miny) / sy)
+        .astype(int)
+        .clip(0, ny - 1)
+    )
+
+    gdf["_ix"] = ix
+    gdf["_iy"] = iy
+
+    bins = gdf.groupby(
+        ["_ix", "_iy"],
+        sort=True
+    )
+
+    children = []
+
+    for n, ((ix, iy), grp) in enumerate(
+        bins,
+        1
+    ):
+        features = [
+            row
+            for _, row
+            in grp.iterrows()
+        ]
+
+        name = f"tile_{ix}_{iy}.b3dm"
+        outp = out / "tiles" / name
+
+        tile_min, tile_max = make_tile(
+            features,
+            outp
+        )
+
+        # Buildings are binned by centroid and can extend past their
+        # grid cell, so bound the tile by its actual footprints.
+        x0, y0, x1, y1 = map(float, grp.total_bounds)
+
+        west, south = Txy.transform(
+            x0, y0
+        )
+
+        east, north = Txy.transform(
+            x1, y1
+        )
+
+        children.append(
+            {
+                "boundingVolume": {
+                    "region": [
+                        math.radians(west),
+                        math.radians(south),
+                        math.radians(east),
+                        math.radians(north),
+                        tile_min,
+                        tile_max
+                    ]
+                },
+
+                "geometricError": 0,
+
+                "content": {
+                    "uri": f"tiles/{name}"
+                }
+            }
+        )
+
+        if n % 25 == 0:
+            print(
+                f"{n}/{len(bins)} tiles",
+                flush=True
+            )
+
+    # ============================================================
+    # TILESET METADATA
+    # ============================================================
+
+    west, south = Txy.transform(
+        minx, miny
+    )
+
+    east, north = Txy.transform(
+        maxx, maxy
+    )
+
+    root = {
+        "boundingVolume": {
+            "region": [
+                math.radians(west),
+                math.radians(south),
+                math.radians(east),
+                math.radians(north),
+                float(gdf.terrain_height.min()),
+                float(
+                    (
+                        gdf.terrain_height
+                        + gdf.height
+                    ).max()
+                )
             ]
         },
-        indent=2
-    ),
-    encoding="utf-8"
-)
 
-print()
-print("=" * 60)
-print("DONE")
-print("=" * 60)
-print(f"Buildings: {len(gdf):,}")
-print(f"Tiles:     {len(children):,}")
-print(f"Output:    {OUT}")
-print()
-print(f"Tileset:   {OUT / 'tileset.json'}")
+        "geometricError": 1000,
+
+        "refine": "ADD",
+
+        "children": children
+    }
+
+    (out / "tileset.json").write_text(
+        json.dumps(
+            {
+                "asset": {
+                    "version": "1.0"
+                },
+                "geometricError": 1000,
+                "root": root
+            },
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+    (out / "conversion_info.json").write_text(
+        json.dumps(
+            {
+                "features": len(gdf),
+                "tiles": len(children),
+                "grid": [nx, ny],
+                "crs": "EPSG:3857",
+                "height_field": "height",
+                **elevation_info,
+                "winding": (
+                    "CCW caps; normalized exterior "
+                    "CCW / interior CW side rings"
+                ),
+                "coordinate_fix": (
+                    "v4 glTF node rotation matrix retained: "
+                    "(x,y,z)->(x,z,-y)"
+                ),
+                "metadata": [
+                    "id",
+                    "height",
+                    "var",
+                    "source",
+                    "region"
+                ]
+            },
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+    print()
+    print("=" * 60)
+    print("DONE")
+    print("=" * 60)
+    print(f"Buildings: {len(gdf):,}")
+    print(f"Tiles:     {len(children):,}")
+    print(f"Output:    {out}")
+    print()
+    print(f"Tileset:   {out / 'tileset.json'}")
+
+
+if __name__ == "__main__":
+    main()

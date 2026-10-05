@@ -55,7 +55,7 @@
   </text>
   <text x="555" y="190" text-anchor="middle" fill="#334155"
         font-family="Inter,Segoe UI,Arial,sans-serif" font-size="14">
-    buildings_to_3dtiles_flat.py
+    buildings_to_3dtiles.py
   </text>
   <text x="555" y="216" text-anchor="middle" fill="#475569"
         font-family="Inter,Segoe UI,Arial,sans-serif" font-size="13">
@@ -89,7 +89,7 @@
   </text>
   <text x="555" y="431" text-anchor="middle" fill="#475569"
         font-family="Inter,Segoe UI,Arial,sans-serif" font-size="13">
-    ↓ terrain_elevations.json
+    ↓ --terrain terrain_elevations.json
   </text>
 
   <line x1="710" y1="196" x2="800" y2="196" stroke="#64748b" stroke-width="3"/>
