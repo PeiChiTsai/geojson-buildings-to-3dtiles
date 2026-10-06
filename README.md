@@ -24,11 +24,11 @@
 
 This repository converts polygon building footprints into spatially tiled **B3DM / 3D Tiles** datasets.
 
-There are two independent workflows:
+There are two workflows, both run by the same script:
 
 | | Flat | Terrain-aligned |
 |---|---|---|
-| Script | `buildings_to_3dtiles_flat.py` | `buildings_to_3dtiles_terrain_aligned.py` |
+| Command | `buildings_to_3dtiles.py` | `buildings_to_3dtiles.py --terrain …` |
 | Base elevation | `0 m` | Cesium World Terrain height |
 | Terrain data | Not required | Required |
 | Cesium ion token | Not required | Required for sampling |
@@ -76,7 +76,7 @@ pip install -r requirements.txt
 ### 4. Run the sample
 
 ```bash
-python src/buildings_to_3dtiles_flat.py
+python src/buildings_to_3dtiles.py
 ```
 
 ### 5. Find the result
@@ -111,7 +111,7 @@ Use this workflow when all buildings should sit on a common horizontal plane.
 data/my_buildings.geojson
           │
           ▼
-buildings_to_3dtiles_flat.py
+buildings_to_3dtiles.py
           │
           ▼
 output/my_city_flat/
@@ -120,7 +120,7 @@ output/my_city_flat/
 ### Run it
 
 ```bash
-python src/buildings_to_3dtiles_flat.py \
+python src/buildings_to_3dtiles.py \
   --input data/my_buildings.geojson \
   --out output/my_city_flat
 ```
@@ -137,7 +137,7 @@ top  = building height
 Change the spatial grid:
 
 ```bash
-python src/buildings_to_3dtiles_flat.py \
+python src/buildings_to_3dtiles.py \
   --input data/my_buildings.geojson \
   --out output/my_city_flat \
   --nx 32 \
@@ -147,7 +147,7 @@ python src/buildings_to_3dtiles_flat.py \
 Change the minimum building height:
 
 ```bash
-python src/buildings_to_3dtiles_flat.py \
+python src/buildings_to_3dtiles.py \
   --input data/my_buildings.geojson \
   --min-height 0.5
 ```
@@ -155,7 +155,7 @@ python src/buildings_to_3dtiles_flat.py \
 See all options:
 
 ```bash
-python src/buildings_to_3dtiles_flat.py --help
+python src/buildings_to_3dtiles.py --help
 ```
 
 ---
@@ -180,7 +180,7 @@ sample_cesium_world_terrain.html
 terrain_elevations.json
       │
       ▼
-buildings_to_3dtiles_terrain_aligned.py
+buildings_to_3dtiles.py --terrain
       │
       ▼
 output/my_city_terrain_aligned/
@@ -214,7 +214,7 @@ The token is entered locally in the browser and is not stored in this repository
 ### 3. Generate terrain-aligned 3D Tiles
 
 ```bash
-python src/buildings_to_3dtiles_terrain_aligned.py \
+python src/buildings_to_3dtiles.py \
   --input data/my_buildings.geojson \
   --terrain data/terrain_elevations.json \
   --out output/my_city_terrain_aligned
@@ -338,30 +338,14 @@ B3DM binary buffer offsets are 4-byte aligned.
 
 # Command-line reference
 
-### Flat
-
 ```bash
-python src/buildings_to_3dtiles_flat.py --help
+python src/buildings_to_3dtiles.py --help
 ```
 
 ```text
 --input
---out
---nx
---ny
---min-height
-```
-
-### Terrain-aligned
-
-```bash
-python src/buildings_to_3dtiles_terrain_aligned.py --help
-```
-
-```text
---input
---terrain
---out
+--terrain      omit for flat output
+--out          default: output/my_city_flat or output/my_city_terrain_aligned
 --nx
 --ny
 --min-height
@@ -382,8 +366,7 @@ geojson-buildings-to-3dtiles/
 │   └── workflow.svg
 │
 ├── src/
-│   ├── buildings_to_3dtiles_flat.py
-│   ├── buildings_to_3dtiles_terrain_aligned.py
+│   ├── buildings_to_3dtiles.py
 │   └── create_centroids.py
 │
 ├── terrain/

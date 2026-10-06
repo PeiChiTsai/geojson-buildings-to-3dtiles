@@ -17,7 +17,7 @@ Required attributes:
 Use this file with:
 
 ```bash
-python src/buildings_to_3dtiles_flat.py
+python src/buildings_to_3dtiles.py
 ```
 
 ## `sample_building_centroids.json`
